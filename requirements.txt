@@ -1,0 +1,6 @@
+cat > requirements.txt << 'EOF'
+pandas
+numpy
+yfinance
+scikit-learn
+EOF
