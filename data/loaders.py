@@ -1,4 +1,3 @@
-cat > data/loaders.py << 'EOF'
 """
 Data loaders (minimal).
 
@@ -15,6 +14,8 @@ Goal:
 from __future__ import annotations
 import pandas as pd
 import yfinance as yf
+import pandas_datareader.data as web
+
 
 TICKERS = ["SHY","IEF","TLT","BIL","TBF"]
 
@@ -25,10 +26,40 @@ def load_prices(start="2007-01-01") -> pd.DataFrame:
     df = df.reindex(columns=TICKERS)
     return df.dropna(how="all")
 
-def load_yields() -> pd.DataFrame:
+def load_yields(series_ids: dict[str, str] | None = None,
+    start="2007-01-01",
+    end=None
+) -> pd.DataFrame:
     """
-    Placeholder for FRED yields. Returns empty DataFrame for now so the rest of the
-    pipeline can run. Later we will add 2y, 10y, 30y, etc.
+    Download Treasury yields from FRED.
+    Default series: 2y, 5y, 10y, 30y (in percent).
+    
+    Parameters
+    ----------
+    series_ids : dict[str, str], optional
+        Mapping from column name -> FRED series ID.
+        Defaults to common Treasury yield curve series.
+    start, end : str or datetime, optional
+        Date range for data.
+    
+    Returns
+    -------
+    pd.DataFrame
+        Columns: 2y, 5y, 10y, 30y (or custom).
+        Forward-filled, business-day aligned.
     """
-    return pd.DataFrame()
-EOF
+    if series_ids is None:
+        series_ids = {
+            "2y": "DGS2",
+            "5y": "DGS5",
+            "10y": "DGS10",
+            "30y": "DGS30",
+        }
+
+    if end is None:
+        end = pd.Timestamp.today().strftime("%Y-%m-%d")
+
+    yields = web.DataReader(list(series_ids.values()), "fred", start, end)
+    yields.columns = list(series_ids.keys())
+    yields = yields.ffill()
+    return yields
