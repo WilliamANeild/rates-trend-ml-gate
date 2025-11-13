@@ -1,4 +1,3 @@
-cat > features/signals.py << 'EOF'
 """
 Signals module.
 Input: 
@@ -85,5 +84,3 @@ def pre_gate_score(momentum_df: pd.DataFrame, carry_df: pd.DataFrame, w_mom=0.7,
         car = carry_df.reindex(common_index)[common_cols].fillna(0.0)
     score = w_mom * mom + w_carry * car
     return score.dropna(how="all")
-
-EOF

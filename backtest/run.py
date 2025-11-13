@@ -1,28 +1,21 @@
-cat > backtest/run.py << 'EOF'
 """
-Backtest runner (stub).
-Input:
-  - will call data loaders and signals later
-Output:
-  - prints placeholders so the pipeline shape is clear
-Goal:
-  Have a single entry point to wire data -> signals -> gate -> allocate -> report.
+run.py — main backtest pipeline runner.
 """
+from backtest import backtest_core, wf_runner, metrics, plotting, ablations, utils
 
-def run_backtest():
-    print("backtest start")
-    # TODO: load data
-    # TODO: build momentum and carry
-    # TODO: compute pre-gate score
-    # TODO: apply gate and allocate
-    # TODO: compute metrics and write simple outputs
-    print("backtest end")
+def main():
+    utils.init_dirs()
+    print("=== Pipeline start ===")
 
-def run_recommend():
-    print("recommendation run start")
-    # TODO: single period weights and short rationale
-    print("recommendation run end")
+    wf_results = wf_runner.run_walkforward(backtest_core.run_backtest)
+    # For simplicity, just use the last segment for now
+    _, _, latest = wf_results[-1]
+    metrics_dict = metrics.compute_all(latest["prices"], latest["weights"])
+    plotting.make_charts(metrics_dict)
+    ablations.run_all(wf_results)
+    utils.save_outputs(metrics_dict)
+
+    print("=== Pipeline done ===")
 
 if __name__ == "__main__":
-    run_backtest()
-EOF
+    main()

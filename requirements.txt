@@ -1,6 +1,6 @@
-cat > requirements.txt << 'EOF'
 pandas
 numpy
 yfinance
 scikit-learn
-EOF
+matplotlib
+pandas_datareader
