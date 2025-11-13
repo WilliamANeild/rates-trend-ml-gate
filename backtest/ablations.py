@@ -1,7 +1,15 @@
-"""
-ablations.py — test simplified variations (no gate, no carry, etc.)
-"""
-def run_all(results):
+def run_ablations(wf_results, metrics_dict=None):
+    """
+    Placeholder ablation hook.
+
+    Parameters
+    ----------
+    wf_results : list
+        List of per segment backtest results from wf_runner.
+    metrics_dict : dict, optional
+        Aggregate metrics from compute_metrics, if needed later.
+    """
     print("[ablations] running ablations...")
-    # e.g., re-run with gate off or with only momentum
-    print("  → baseline vs no-gate vs no-carry TBD")
+    print("  → baseline vs no gate vs no carry still to be implemented")
+    # For now we just keep the hook here so the pipeline does not break.
+    return

@@ -7,44 +7,31 @@ from sklearn.calibration import CalibratedClassifierCV
 
 def make_labels(prices_df, momentum_df, horizon_days, hurdle_rule=0):
     """
-    Creates binary classification labels (0 or 1) by comparing future price movements
-    with momentum signals.
+    Create binary labels by checking whether momentum direction matches
+    future price direction over a given horizon.
 
-    Inputs
-    -------
-    prices_df : DataFrame
-        Asset prices (index = dates, columns = assets).
-    momentum_df : DataFrame
-        Momentum indicators from Liam's code (same structure).
-    horizon_days : int
-        Number of days to look ahead for returns.
-    hurdle_rule : float
-        Minimum absolute momentum value to consider (filters out weak signals).
-
-    Output
-    -------
-    labels : DataFrame
-        Binary labels where 1 indicates momentum correctly predicts future direction.
+    labels[i, t] = 1 if sign(momentum[i, t]) == sign(future_return[i, t]), else 0.
+    If hurdle_rule > 0, we drop weak momentum observations instead of forcing them to 0.
     """
     # Future returns over the specified horizon
     future_returns = prices_df.pct_change(horizon_days).shift(-horizon_days)
 
-    # Align future_returns and momentum_df on the same index/columns
+    # Align on same dates and tickers
     future_returns, momentum_df = future_returns.align(momentum_df, join="inner")
 
     # Directional signs
     future_signs = np.sign(future_returns)
     momentum_signs = np.sign(momentum_df)
 
-    # Label = 1 when sign matches, 0 otherwise
-    labels = (future_signs == momentum_signs).astype(int)
+    # 1 if signs match, 0 otherwise
+    labels = (future_signs == momentum_signs).astype(float)  # 1.0 or 0.0
 
     if hurdle_rule > 0:
-        # Filter out weak signals below the hurdle threshold
-        strong_mask = (momentum_df.abs() > hurdle_rule).astype(int)
-        labels = labels * strong_mask
+        # Keep only strong momentum; weak signals become NaN (ignored in training)
+        strong_mask = momentum_df.abs() > hurdle_rule
+        labels = labels.where(strong_mask)
 
-    # Drop any rows that are all NaN (e.g. at the very end of the series)
+    # Drop any rows that are all NaN (for example at the end of series)
     labels = labels.dropna(how="all")
 
     return labels
@@ -52,44 +39,34 @@ def make_labels(prices_df, momentum_df, horizon_days, hurdle_rule=0):
 
 def fit_gate(features_df, labels):
     """
-    Trains a machine learning model to predict the reliability of momentum signals.
+    Train an ML gate that predicts when momentum is likely to be right.
 
-    Inputs
-    -------
-    features_df : DataFrame
-        Features derived from Liam's momentum indicators.
-    labels : DataFrame or Series
-        Binary labels from make_labels() function. If DataFrame, we flatten to 1D.
-
-    Output
-    -------
-    model_dict : dict
-        Contains trained model and feature scaler.
+    features_df: DataFrame of features (index = dates, columns = feature names).
+    labels: DataFrame or Series from make_labels. If DataFrame (assets x time),
+            we collapse cross section into a single label per date.
     """
-    # If labels is a DataFrame (assets x time), flatten to a 1D Series
+    # If labels is a DataFrame (assets x time), flatten to a 1D Series by averaging
     if isinstance(labels, pd.DataFrame):
-        # Simple approach: average across assets and treat >0.5 as 1
+        # Average across assets, then treat > 0.5 as "momentum works" (1), else 0
         y_series = (labels.mean(axis=1) > 0.5).astype(int)
     else:
         y_series = labels.astype(int)
 
-    # Align features and labels
+    # Align features and labels on the time index
     features_df, y_series = features_df.align(y_series, join="inner", axis=0)
 
-    # Initialize logistic regression with elastic net regularization
-    model = LogisticRegression(
+    # Standardize features
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(features_df)
+
+    # Logistic regression with elastic net, wrapped in a calibrated classifier
+    base_model = LogisticRegression(
         penalty="elasticnet",
         solver="saga",
         l1_ratio=0.5,
         max_iter=1000,
     )
-
-    # Standardize features to zero mean and unit variance
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(features_df)
-
-    # Calibrate probability estimates using cross-validation
-    calibrated_model = CalibratedClassifierCV(model, cv=5)
+    calibrated_model = CalibratedClassifierCV(base_model, cv=5)
     calibrated_model.fit(X_scaled, y_series)
 
     return {"model": calibrated_model, "scaler": scaler}
@@ -97,52 +74,45 @@ def fit_gate(features_df, labels):
 
 def predict_gate(model_dict, features_df):
     """
-    Generates probability predictions for new momentum signals.
+    Use the trained gate to get probabilities that momentum is correct.
 
-    Inputs
-    -------
-    model_dict : dict
-        Trained model dictionary from fit_gate().
-    features_df : DataFrame
-        New features to predict on.
-
-    Output
-    -------
-    prob_series : Series
-        Probabilities (0–1) indicating confidence in momentum signals.
+    Returns a Series indexed by date with values in [0, 1].
     """
-    # Use the same feature alignment as in training if needed
+    # Align features to scaler feature order if needed (assumes same columns)
     X_scaled = model_dict["scaler"].transform(features_df)
     probabilities = model_dict["model"].predict_proba(X_scaled)[:, 1]
     return pd.Series(probabilities, index=features_df.index)
 
-
 def prob_to_multiplier(prob_series):
     """
-    Converts probability predictions into position size multipliers.
-
-    Input
-    -----
-    prob_series : Series
-        Probability predictions from predict_gate().
-
-    Output
-    ------
-    multipliers : Series
-        Multipliers (0–1) to scale position sizes.
+    TEMP: disable ML gating.
+    Always use full position (multiplier = 1.0).
     """
-    # Ensure probabilities are in valid range
-    clipped_probs = np.clip(prob_series, 0, 1)
+    return pd.Series(1.0, index=prob_series.index)
+'''
+def prob_to_multiplier(prob_series, floor=0.5, cap=1.5):
+    """
+    Map probabilities to position size multipliers around 1.0.
 
-    # Direct mapping: higher probability = larger position size
-    multipliers = clipped_probs
+    p = 0.00 -> floor  (for example 0.5x)
+    p = 0.50 -> 1.0x   (neutral)
+    p = 1.00 -> cap    (for example 1.5x)
+
+    This lets the gate both cut exposure when it hates momentum
+    and increase exposure when it is confident.
+    """
+    clipped = np.clip(prob_series, 0.0, 1.0)
+
+    # Linear mapping: 0 -> floor, 0.5 -> 1, 1 -> cap
+    multipliers = floor + (cap - floor) * (clipped - 0.5) / 0.5
+    multipliers = np.clip(multipliers, floor, cap)
 
     return pd.Series(multipliers, index=prob_series.index)
-
+'''
 # Integration Flow:
-# 1. Liam's code generates momentum signals and features.
-# 2. make_labels() uses these to create training labels.
-# 3. fit_gate() trains model on features and labels.
-# 4. predict_gate() generates confidence scores for new signals.
-# 5. prob_to_multiplier() converts confidence to position sizing.
-# 6. Final positions = Liam's momentum signals * our multipliers.
+# 1. Momentum code generates signals and features.
+# 2. make_labels() builds training labels off prices and momentum.
+# 3. fit_gate() trains the calibrated logistic model.
+# 4. predict_gate() returns probabilities that momentum is right.
+# 5. prob_to_multiplier() converts those probabilities into size multipliers.
+# 6. Final positions = base momentum weights * multipliers.

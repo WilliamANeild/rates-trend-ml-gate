@@ -111,18 +111,21 @@ def apply_constraints(
     cash_floor: float = 0.05,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Apply simple portfolio constraints:
-    - per-asset caps from `caps` dict
-    - enforce a minimum cash allocation if there is a 'BIL' or 'cash' sleeve
-    - re-normalize rows to sum to 1
-    - return a risk_flags DataFrame where caps were hit.
+    Apply portfolio constraints:
+
+    - Per-asset caps from `caps` (in absolute value)
+    - Enforce a minimum allocation to the cash sleeve (BIL / *cash*)
+    - Cap gross leverage at 1.0 (sum of abs weights)
+    - Top up any leftover into cash
+    - Return risk flags where constraints were active
 
     Parameters
     ----------
     weights : DataFrame
         Raw weights (rows = dates, columns = assets).
     caps : dict[str, float], optional
-        Per-asset max weights, e.g. {"TLT": 0.25, "TBF": 0.10}.
+        Per-asset max abs weights, e.g. {"TLT": 0.25, "TBF": 0.10}.
+        If None, defaults to 0.35 for every column.
     cash_floor : float
         Minimum allocation to the cash sleeve.
 
@@ -131,32 +134,66 @@ def apply_constraints(
     constrained : DataFrame
         Constrained and re-normalized weights.
     risk_flags : DataFrame
-        Boolean flags where raw weights wanted to exceed the caps.
+        Boolean flags with columns:
+        ["capped_asset", "cash_floor", "leverage_capped"].
     """
     constrained = weights.copy()
-    risk_flags = pd.DataFrame(False, index=weights.index, columns=weights.columns)
+    tickers = list(constrained.columns)
 
-    # Treat 'BIL' or any column containing 'cash' as cash
-    cash_cols = [c for c in constrained.columns if "cash" in c.lower()]
-    if "BIL" in constrained.columns and "BIL" not in cash_cols:
-        cash_cols.append("BIL")
-    cash_col = cash_cols[0] if cash_cols else None
+    # Default caps if none provided
+    if caps is None:
+        caps = {t: 0.35 for t in tickers}
 
-    # Apply per-asset caps
-    if caps is not None:
-        for col, cap in caps.items():
-            if col in constrained.columns:
-                original = constrained[col].copy()
-                constrained[col] = constrained[col].clip(upper=cap, lower=-cap)
-                # Flag where we wanted to exceed the cap
-                risk_flags[col] = (original.abs() > cap + 1e-9)
+    # Identify cash column (prefer BIL, otherwise anything with 'cash')
+    cash_col = None
+    for t in tickers:
+        if t.upper() == "BIL":
+            cash_col = t
+            break
+    if cash_col is None:
+        for t in tickers:
+            if "cash" in t.lower():
+                cash_col = t
+                break
 
-    # Enforce a floor on cash if a cash column exists
+    # Risk flags table
+    risk_flags = pd.DataFrame(
+        index=constrained.index,
+        columns=["capped_asset", "cash_floor", "leverage_capped"],
+        data=False,
+    )
+
+    # 1) Per-asset caps (long/short, by abs value)
+    for t in tickers:
+        cap = caps.get(t, 0.35)
+        before = constrained[t]
+        after = before.clip(lower=-cap, upper=cap)
+        capped_mask = before.ne(after)
+        if capped_mask.any():
+            risk_flags.loc[capped_mask, "capped_asset"] = True
+        constrained[t] = after
+
+    # 2) Enforce cash floor if we have a cash column
     if cash_col is not None:
-        constrained[cash_col] = constrained[cash_col].clip(lower=cash_floor)
+        before = constrained[cash_col]
+        after = before.clip(lower=cash_floor)
+        cash_mask = before.ne(after)
+        if cash_mask.any():
+            risk_flags.loc[cash_mask, "cash_floor"] = True
+        constrained[cash_col] = after
 
-    # Row-wise renormalization to sum to 1
-    row_sum = constrained.sum(axis=1).replace(0, np.nan)
-    constrained = constrained.div(row_sum, axis=0).fillna(0.0)
+    # 3) Cap gross leverage (sum of |weights|) at 1.0
+    gross = constrained.abs().sum(axis=1)
+    leverage_mask = gross > 1.0
+    scale = 1.0 / gross.clip(lower=1.0)
+    constrained = constrained.mul(scale, axis=0)
+    if leverage_mask.any():
+        risk_flags.loc[leverage_mask, "leverage_capped"] = True
+
+    # 4) If leverage < 1 and we have cash, put leftover into cash
+    if cash_col is not None:
+        row_sum = constrained.sum(axis=1)
+        add_to_cash = (1.0 - row_sum).clip(lower=0.0)
+        constrained[cash_col] += add_to_cash
 
     return constrained, risk_flags
