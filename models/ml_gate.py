@@ -5,7 +5,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.calibration import CalibratedClassifierCV
 
 
-def make_labels(prices_df, momentum_df, horizon_days, hurdle_rule=0):
+def make_labels(prices_df, momentum_df, horizon_days, hurdle_rule=0.0):
     """
     Create binary labels by checking whether momentum direction matches
     future price direction over a given horizon.
@@ -14,7 +14,7 @@ def make_labels(prices_df, momentum_df, horizon_days, hurdle_rule=0):
     If hurdle_rule > 0, we drop weak momentum observations instead of forcing them to 0.
     """
     # Future returns over the specified horizon
-    future_returns = prices_df.pct_change(horizon_days).shift(-horizon_days)
+    future_returns = prices_df.pct_change(horizon_days, fill_method=None).shift(-horizon_days)
 
     # Align on same dates and tickers
     future_returns, momentum_df = future_returns.align(momentum_df, join="inner")
@@ -83,32 +83,46 @@ def predict_gate(model_dict, features_df):
     probabilities = model_dict["model"].predict_proba(X_scaled)[:, 1]
     return pd.Series(probabilities, index=features_df.index)
 
-def prob_to_multiplier(prob_series):
-    """
-    TEMP: disable ML gating.
-    Always use full position (multiplier = 1.0).
-    """
-    return pd.Series(1.0, index=prob_series.index)
-'''
-def prob_to_multiplier(prob_series, floor=0.5, cap=1.5):
+
+def prob_to_multiplier(
+    prob_series: pd.Series,
+    low: float = 0.45,
+    high: float = 0.55,
+    min_mult: float = 0.3,
+    max_mult: float = 1.5,
+) -> pd.Series:
     """
     Map probabilities to position size multipliers around 1.0.
 
-    p = 0.00 -> floor  (for example 0.5x)
-    p = 0.50 -> 1.0x   (neutral)
-    p = 1.00 -> cap    (for example 1.5x)
+    Logic:
+      - p <= low  -> min_mult  (cut risk hard when model is cold)
+      - p >= high -> max_mult  (lean in when model is confident)
+      - linear interpolation between low and high
+      - flat at the ends
 
-    This lets the gate both cut exposure when it hates momentum
-    and increase exposure when it is confident.
+    This keeps sizing honest and bounded while letting the ML gate matter.
     """
-    clipped = np.clip(prob_series, 0.0, 1.0)
+    p = np.clip(prob_series.values, 0.0, 1.0)
 
-    # Linear mapping: 0 -> floor, 0.5 -> 1, 1 -> cap
-    multipliers = floor + (cap - floor) * (clipped - 0.5) / 0.5
-    multipliers = np.clip(multipliers, floor, cap)
+    m = np.empty_like(p, dtype=float)
 
-    return pd.Series(multipliers, index=prob_series.index)
-'''
+    # Below low: min_mult
+    below = p <= low
+    m[below] = min_mult
+
+    # Above high: max_mult
+    above = p >= high
+    m[above] = max_mult
+
+    # Between low and high: linear ramp from min_mult to max_mult
+    mid = (~below) & (~above)
+    if mid.any():
+        span = max(high - low, 1e-6)
+        frac = (p[mid] - low) / span
+        m[mid] = min_mult + frac * (max_mult - min_mult)
+
+    return pd.Series(m, index=prob_series.index)
+
 # Integration Flow:
 # 1. Momentum code generates signals and features.
 # 2. make_labels() builds training labels off prices and momentum.

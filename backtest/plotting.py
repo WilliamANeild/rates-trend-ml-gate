@@ -1,143 +1,128 @@
-# backtest/plotting.py
+"""
+Plotting utilities for the rates ML-gated backtest.
+
+Builds equity curves for:
+  - ML-gated strategy
+  - Buy & hold IEF, TLT, BIL
+
+Window: 2020-01-01 through end of data.
+"""
+
+import os
+from typing import Dict
 
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 
-plt.style.use("default")  # white background
+import data.loaders as loaders
 
 
-# Simple blue palette
-COLORS = {
-    "strategy": "#0b3954",  # dark blue
-    "SHY": "#1f77b4",
-    "IEF": "#4f9dda",
-    "TLT": "#77b7ff",
-    "BIL": "#a7cfff",
-    "TBF": "#c8ddff",
-}
+def _equity_curve(returns: pd.Series, start_value: float = 20_000.0) -> pd.Series:
+    """Convert daily returns into a dollar equity curve."""
+    return start_value * (1.0 + returns).cumprod()
 
 
-def _plot_equity_vs_benchmark(strategy_equity: pd.Series,
-                              benchmark_equity: pd.Series) -> None:
-    fig, ax = plt.subplots(figsize=(10, 5))
-
-    ax.plot(strategy_equity.index, strategy_equity.values,
-            label="ML-gated rates strategy", linewidth=2.0,
-            color=COLORS["strategy"])
-    ax.plot(benchmark_equity.index, benchmark_equity.values,
-            label=f"Buy & hold {benchmark_equity.name}",
-            linewidth=1.5, linestyle="--", color=COLORS.get("IEF", "#1f77b4"))
-
-    ax.set_title("Growth of $20,000: Strategy vs Benchmark")
-    ax.set_xlabel("Date")
-    ax.set_ylabel("Portfolio value ($)")
-    ax.legend(loc="upper left")
-    ax.grid(True, alpha=0.25)
-
-    # Force y-axis to stay above zero
-    ymin = max(0.0, strategy_equity.min() * 0.95)
-    ax.set_ylim(bottom=ymin)
-
-    fig.tight_layout()
-    fig.savefig("reports/equity_vs_benchmark.png", dpi=150)
-    plt.close(fig)
-
-
-def _plot_drawdown(drawdown: pd.Series) -> None:
-    fig, ax = plt.subplots(figsize=(10, 4))
-
-    ax.plot(drawdown.index, drawdown.values,
-            linewidth=1.5, color=COLORS["strategy"])
-
-    ax.set_title("Strategy Drawdown")
-    ax.set_xlabel("Date")
-    ax.set_ylabel("Drawdown (from peak, %)")
-    ax.grid(True, alpha=0.25)
-
-    # drawdown is negative; show 0 at top
-    ax.set_ylim(top=0.0)
-
-    fig.tight_layout()
-    fig.savefig("reports/drawdown.png", dpi=150)
-    plt.close(fig)
-
-
-def _plot_rolling_vol(rolling_vol: pd.Series) -> None:
-    fig, ax = plt.subplots(figsize=(10, 4))
-
-    ax.plot(rolling_vol.index, rolling_vol.values,
-            linewidth=1.5, color=COLORS["strategy"])
-
-    ax.set_title("Rolling Volatility (63-day, annualized)")
-    ax.set_xlabel("Date")
-    ax.set_ylabel("Volatility")
-    ax.grid(True, alpha=0.25)
-
-    fig.tight_layout()
-    fig.savefig("reports/rolling_vol.png", dpi=150)
-    plt.close(fig)
-
-
-def _plot_equity_vs_bonds_20000(strategy_equity: pd.Series,
-                                bond_equity: pd.DataFrame) -> None:
+def make_charts(metrics_dict: Dict, out_dir: str = "reports") -> None:
     """
-    Pretty comparison: ML strategy vs individual bond ETFs,
-    all starting from $20,000.
+    Entry point used by backtest/run.py.
+
+    We ignore metrics_dict and rebuild what we need from:
+      - outputs/strategy_returns.csv
+      - prices from data.loaders.load_prices()
     """
-    fig, ax = plt.subplots(figsize=(12, 5))
+    os.makedirs(out_dir, exist_ok=True)
 
-    # Strategy
-    ax.plot(strategy_equity.index, strategy_equity.values,
-            label="ML-gated rates strategy",
-            linewidth=2.5, color=COLORS["strategy"])
+    # Strategy returns from the backtest outputs
+    strat_rets = (
+        pd.read_csv("outputs/strategy_returns.csv", index_col=0, parse_dates=True)
+        .iloc[:, 0]
+        .sort_index()
+    )
 
-    # Bonds (different blue shades)
-    for col in bond_equity.columns:
-        ax.plot(
-            bond_equity.index,
-            bond_equity[col].values,
-            label=f"Buy & hold {col}",
-            linewidth=1.2,
-            color=COLORS.get(col, "#9ecae1"),
-            alpha=0.9,
+    # ETF prices, then simple daily returns
+    prices = loaders.load_prices().sort_index()  # columns: SHY, IEF, TLT, BIL, TBF ...
+    etf_rets = prices.pct_change().fillna(0.0)
+
+    fig_path = os.path.join(out_dir, "equity_vs_bond_etfs_2020_2025.png")
+
+    plot_equity_vs_bonds(
+        strat_rets=strat_rets,
+        etf_rets=etf_rets,
+        start_date="2020-01-01",
+        out_path=fig_path,
+    )
+
+
+def plot_equity_vs_bonds(
+    strat_rets: pd.Series,
+    etf_rets: pd.DataFrame,
+    start_date: str = "2020-01-01",
+    out_path: str | None = None,
+) -> None:
+    """
+    Plot strategy equity vs selected bond ETFs from a given start date onward.
+
+    Shown:
+      - Strategy
+      - IEF, TLT, BIL
+
+    Hidden:
+      - SHY, TBF (even if present in etf_rets)
+    """
+    # Align on common index and cut to desired window
+    all_rets = pd.concat(
+        [strat_rets.rename("STRAT"), etf_rets],
+        axis=1,
+        join="inner",
+    ).sort_index()
+
+    all_rets = all_rets.loc[start_date:]
+
+    strat = all_rets["STRAT"]
+
+    # Only keep IEF, TLT, BIL if they exist
+    keep_cols = [c for c in ["IEF", "TLT", "SHY"] if c in all_rets.columns]
+    bonds = all_rets[keep_cols]
+
+    # Equity curves
+    eq_strat = _equity_curve(strat)
+    eq_bonds = {c: _equity_curve(bonds[c]) for c in keep_cols}
+
+    plt.figure(figsize=(14, 4))
+
+    # Strategy in black
+    plt.plot(
+        eq_strat.index,
+        eq_strat.values,
+        color="black",
+        linewidth=2.0,
+        label="ML-gated rates strategy",
+    )
+
+    # ETF colors, all solid
+    color_map = {
+        "IEF": "tab:blue",
+        "TLT": "purple",
+        "BIL": "gray",
+    }
+
+    for c in keep_cols:
+        plt.plot(
+            eq_bonds[c].index,
+            eq_bonds[c].values,
+            color=color_map.get(c, "dimgray"),
+            linewidth=1.5,
+            label=f"Buy & hold {c}",
         )
 
-    ax.set_title("Growth of $20,000: ML-Gated Strategy vs Bond ETFs")
-    ax.set_xlabel("Date")
-    ax.set_ylabel("Portfolio value ($)")
-    ax.legend(loc="upper left")
-    ax.grid(True, alpha=0.25)
+    plt.title("Growth of $20,000 (2020-2025): Strategy vs Bond ETFs")
+    plt.xlabel("Date")
+    plt.ylabel("Portfolio value ($)")
+    plt.legend(loc="upper left")
+    plt.grid(False)
+    plt.tight_layout()
 
-    # Force everything to stay above zero on the chart
-    all_vals = pd.concat([strategy_equity, bond_equity], axis=1)
-    ymin = max(0.0, all_vals.min().min() * 0.95)
-    ax.set_ylim(bottom=ymin)
-
-    fig.tight_layout()
-    fig.savefig("reports/equity_vs_bonds_20000.png", dpi=150)
-    plt.close(fig)
-
-
-def make_charts(metrics_dict: dict) -> None:
-    """
-    Entry point called from backtest.run
-
-    metrics_dict must contain:
-      - 'strategy_equity' (Series)
-      - 'benchmark_equity' (Series)
-      - 'bond_equity' (DataFrame)
-      - 'drawdown' (Series)
-      - 'rolling_vol' (Series)
-    """
-    strat_eq: pd.Series = metrics_dict["strategy_equity"]
-    bench_eq: pd.Series = metrics_dict["benchmark_equity"]
-    bond_eq: pd.DataFrame = metrics_dict["bond_equity"]
-    drawdown: pd.Series = metrics_dict["drawdown"]
-    rolling_vol: pd.Series = metrics_dict["rolling_vol"]
-
-    _plot_equity_vs_benchmark(strat_eq, bench_eq)
-    _plot_drawdown(drawdown)
-    _plot_rolling_vol(rolling_vol)
-    _plot_equity_vs_bonds_20000(strat_eq, bond_eq)
-
-    print("[plotting] charts saved to reports")
+    if out_path is not None:
+        plt.savefig(out_path, dpi=200)
+    plt.close()

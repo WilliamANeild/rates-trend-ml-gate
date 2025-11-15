@@ -75,34 +75,58 @@ def risk_parity_scale(
 def apply_gate(
     base_weights: pd.DataFrame,
     gated_signal: pd.DataFrame,
+    alpha: float = 0.7,
 ) -> pd.DataFrame:
     """
-    Apply ML gate to base weights.
+    Tilt the portfolio toward the strongest ML-gated signals.
+
+    Logic:
+      - Use gated_signal as a strength measure (only care about positives).
+      - Each day, build an "overlay" portfolio that invests only in
+        assets with positive signals, proportional to their signal size.
+      - Final weights = (1 - alpha) * base_weights + alpha * overlay
+        on days with positive signals; otherwise just base_weights.
 
     Parameters
     ----------
     base_weights : DataFrame
-        Baseline portfolio weights (risk-parity scaled from scores).
+        Baseline portfolio weights (risk-parity from scores).
     gated_signal : DataFrame
         Score * ML multiplier, same shape as base_weights.
+    alpha : float
+        Fraction of capital shifted into the overlay (0 = no tilt, 1 = all overlay).
 
     Returns
     -------
-    gated_weights : DataFrame
-        Base weights scaled by the relative strength of the gated signal.
+    tilted_weights : DataFrame
+        New weights after tilting toward strongest signals.
     """
     # Align shapes
-    base_weights, gated_signal = base_weights.align(gated_signal, join="inner")
+    bw, gs = base_weights.align(gated_signal, join="inner")
 
-    # Use the absolute gated signal as an intensity measure per asset
-    gate_abs = gated_signal.abs()
+    # Only use positive signals for allocating extra capital
+    pos = gs.clip(lower=0.0)
 
-    # Normalize per row so the strongest signal in a row gets multiplier 1
-    max_abs = gate_abs.max(axis=1).replace(0, np.nan)
-    scale = gate_abs.div(max_abs, axis=0).fillna(0.0)
+    # Row-wise sum of positive signals
+    row_sum = pos.sum(axis=1)
 
-    gated_weights = base_weights * scale
-    return gated_weights
+    # Overlay weights: normalize positive signals to sum to 1 where possible
+    overlay = pos.div(row_sum.replace(0.0, np.nan), axis=0)
+
+    # Mask of dates with any positive signal
+    has_pos = row_sum > 0.0
+
+    # Start from base weights
+    tilted = bw.copy()
+
+    # Blend base and overlay where we have positive signals
+    idx = tilted.index[has_pos]
+    tilted.loc[idx] = (1.0 - alpha) * bw.loc[idx] + alpha * overlay.loc[idx]
+
+    # Replace remaining NaNs (e.g. all-zero rows) with 0
+    tilted = tilted.fillna(0.0)
+
+    return tilted
 
 
 def apply_constraints(

@@ -1,6 +1,6 @@
 """
 Signals module.
-Input: 
+Input:
   - prices: pandas DataFrame of daily adjusted closes, columns = tickers
   - yields_df: pandas DataFrame of Treasury yields if available (optional)
 Output:
@@ -15,72 +15,128 @@ from __future__ import annotations
 import pandas as pd
 import numpy as np
 
+
 def _zscore(df: pd.DataFrame, lookback: int = 252) -> pd.DataFrame:
-    mu = df.rolling(lookback, min_periods=lookback//4).mean()
-    sd = df.rolling(lookback, min_periods=lookback//4).std()
+    """
+    Time series z-score by column, using a rolling window.
+    """
+    mu = df.rolling(lookback, min_periods=lookback // 4).mean()
+    sd = df.rolling(lookback, min_periods=lookback // 4).std()
     return (df - mu) / sd
 
-def momentum_features(prices: pd.DataFrame, windows=(5,20,60,120)) -> pd.DataFrame:
+
+def momentum_features(
+    prices: pd.DataFrame,
+    windows: tuple[int, ...] = (20, 60, 120),
+) -> pd.DataFrame:
     """
-    For each window, compute sum of daily returns over that window.
-    Return a single DataFrame = average of z-scored windows.
-    No lookahead: uses past data only.
+    Multi-window momentum based on rolling Sharpe of log returns.
+
+    For each window w:
+      - compute daily log returns
+      - compute rolling mean and std over past w days
+      - Sharpe_w = mean_w / std_w
+      - time z-score Sharpe_w over a long window
+
+    Then average the z-scored Sharpe values across windows.
+    No lookahead: all operations only use past data.
     """
-    rets = prices.pct_change()
-    feats = []
+    # log returns are more stable for long histories
+    log_prices = np.log(prices)
+    rets = log_prices.diff()
+
+    feats_z = []
     for w in windows:
-        feat = rets.rolling(w, min_periods=max(2, w//2)).sum()
-        feats.append(_zscore(feat))
-    mom = pd.concat(feats, axis=1).groupby(level=0, axis=1).mean()
+        roll_mean = rets.rolling(w, min_periods=max(5, w // 2)).mean()
+        roll_std = rets.rolling(w, min_periods=max(5, w // 2)).std()
+
+        sharpe = roll_mean / roll_std
+        sharpe_z = _zscore(sharpe)
+        feats_z.append(sharpe_z)
+
+    # simple average of the z-scored windows
+    mom = None
+    for f in feats_z:
+        if mom is None:
+            mom = f.copy()
+        else:
+            mom = mom.add(f, fill_value=0.0)
+    mom = mom / len(feats_z)
+
     mom = mom.dropna(how="all")
     return mom
 
+
 def carry_proxy(yields_df: pd.DataFrame | None, tickers: list[str]) -> pd.DataFrame:
     """
-    Very simple carry stand-in.
+    Very simple carry stand in.
+
     If yields_df provided, map ETF duration buckets to yield levels.
     If None, return zeros so the pipeline still runs.
+
     Mapping defaults:
-      SHY -> 2y, IEF -> 10y, TLT -> 30y, BIL -> cash ~ 3m, TBF -> negative TLT carry.
+      SHY -> 2y, IEF -> 10y, TLT -> 30y, BIL -> cash about 3m, TBF -> negative TLT carry.
     """
-    idx = None
-    if yields_df is not None and not yields_df.empty:
-        idx = yields_df.index
-        tenors = {
-            "SHY": "DGS2",
-            "IEF": "DGS10",
-            "TLT": "DGS30",
-            "BIL": "DGS3MO",   # will be NaN if not present
-            "TBF": "DGS30",    # inverse exposure, sign flipped later
-        }
-        out = {}
-        for t in tickers:
-            k = tenors.get(t, None)
-            if k is None or k not in yields_df.columns:
-                out[t] = pd.Series(0.0, index=idx)
-            else:
-                s = yields_df[k].astype(float)
-                if t == "TBF":
-                    s = -s
-                out[t] = s
-        carry = pd.DataFrame(out).reindex(idx).ffill()
-        carry = _zscore(carry)
-    else:
-        # zeros with the same index as prices will be set by caller
-        carry = pd.DataFrame(columns=tickers)
+    if yields_df is None or yields_df.empty:
+        # caller will reindex to prices index
+        return pd.DataFrame(columns=tickers)
+
+    idx = yields_df.index
+    tenors = {
+        "SHY": "DGS2",
+        "IEF": "DGS10",
+        "TLT": "DGS30",
+        "BIL": "DGS3MO",  # may be NaN if not present
+        "TBF": "DGS30",   # inverse exposure, sign flipped below
+    }
+
+    out: dict[str, pd.Series] = {}
+    for t in tickers:
+        k = tenors.get(t)
+        if k is None or k not in yields_df.columns:
+            out[t] = pd.Series(0.0, index=idx)
+        else:
+            s = yields_df[k].astype(float)
+            if t == "TBF":
+                s = -s
+            out[t] = s
+
+    carry = pd.DataFrame(out).reindex(idx).ffill()
+    carry = _zscore(carry)
+    carry = carry.dropna(how="all")
     return carry
 
-def pre_gate_score(momentum_df: pd.DataFrame, carry_df: pd.DataFrame, w_mom=0.7, w_carry=0.3) -> pd.DataFrame:
+
+def pre_gate_score(
+    momentum_df: pd.DataFrame,
+    carry_df: pd.DataFrame,
+    w_mom: float = 0.8,
+    w_carry: float = 0.2,
+) -> pd.DataFrame:
     """
     Blend momentum and carry into a single score per ticker.
-    Align on the intersection of available dates and tickers.
+
+    Steps:
+      - align on common dates and tickers
+      - if carry_df is empty, use zero carry
+      - compute weighted sum: score = w_mom * mom + w_carry * carry
+      - drop all NaN rows
     """
     common_index = momentum_df.index
-    common_cols = [c for c in momentum_df.columns if c in carry_df.columns] if not carry_df.empty else momentum_df.columns
-    mom = momentum_df[common_cols]
     if carry_df.empty:
+        common_cols = momentum_df.columns
         car = pd.DataFrame(0.0, index=common_index, columns=common_cols)
     else:
-        car = carry_df.reindex(common_index)[common_cols].fillna(0.0)
+        common_cols = [c for c in momentum_df.columns if c in carry_df.columns]
+        if not common_cols:
+            # fall back to momentum only
+            common_cols = momentum_df.columns
+            car = pd.DataFrame(0.0, index=common_index, columns=common_cols)
+        else:
+            car = carry_df.reindex(common_index)[common_cols].fillna(0.0)
+
+    mom = momentum_df[common_cols]
+
     score = w_mom * mom + w_carry * car
-    return score.dropna(how="all")
+    score = score.dropna(how="all")
+    return score
